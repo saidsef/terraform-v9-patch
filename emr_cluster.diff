@@ -1,0 +1,281 @@
+diff --git a/builtin/providers/aws/resource_aws_emr_cluster.go b/builtin/providers/aws/resource_aws_emr_cluster.go
+index f1a0d55..2b2aa37 100644
+--- a/builtin/providers/aws/resource_aws_emr_cluster.go
++++ b/builtin/providers/aws/resource_aws_emr_cluster.go
+@@ -54,11 +54,62 @@ func resourceAwsEMRCluster() *schema.Resource {
+ 				Type:     schema.TypeString,
+ 				Computed: true,
+ 			},
+-			"log_uri": {
++			"additional_info": {
+ 				Type:     schema.TypeString,
+ 				ForceNew: true,
+ 				Optional: true,
+ 			},
++			"steps": {
++				Type:     schema.TypeList,
++				ForceNew: true,
++				Optional: true,
++				Elem: &schema.Resource{
++					Schema: map[string]*schema.Schema{
++						"name": {
++							Type:     schema.TypeString,
++							Required: true,
++						},
++						"args": {
++							Type:     schema.TypeList,
++							Optional: true,
++							ForceNew: true,
++							Elem:     &schema.Schema{Type: schema.TypeString},
++						},
++						"action_on_failure": {
++							Type:     schema.TypeString,
++							Required: true,
++							ForceNew: true,
++						},
++						"jar": {
++							Type:     schema.TypeString,
++							Optional: true,
++							ForceNew: true,
++						},
++						"class": {
++							Type:     schema.TypeString,
++							Optional: true,
++							ForceNew: true,
++						},
++						"properties": {
++							/*
++								example terraform:
++								properties {
++											property : "Value"
++											property2 : "Value2"
++										  }
++							*/
++							Type:     schema.TypeMap,
++							Optional: true,
++							ForceNew: true,
++						},
++					},
++				},
++			},
++			"log_uri": {
++				Type:     schema.TypeString,
++				Optional: true,
++				Computed: true,
++			},
+ 			"master_public_dns": {
+ 				Type:     schema.TypeString,
+ 				Computed: true,
+@@ -112,6 +163,12 @@ func resourceAwsEMRCluster() *schema.Resource {
+ 							Type:     schema.TypeString,
+ 							Optional: true,
+ 						},
++						/*
++						"MasterInstanceFleet"
++						"MasterInstanceGroup"
++						"CoreInstanceFleet"
++						"CoreInstanceGroup"
++						*/
+ 						"instance_profile": {
+ 							Type:     schema.TypeString,
+ 							Required: true,
+@@ -167,6 +224,11 @@ func resourceAwsEMRCluster() *schema.Resource {
+ 				ForceNew: true,
+ 				Optional: true,
+ 			},
++			"scale_down_behavior": &schema.Schema{
++				Type:     schema.TypeString,
++				ForceNew: true,
++				Optional: true,
++			},
+ 			"visible_to_all_users": {
+ 				Type:     schema.TypeBool,
+ 				Optional: true,
+@@ -265,7 +327,17 @@ func resourceAwsEMRClusterCreate(d *schema.ResourceData, meta interface{}) error
+ 		ServiceRole:       aws.String(d.Get("service_role").(string)),
+ 		VisibleToAllUsers: aws.Bool(d.Get("visible_to_all_users").(bool)),
+ 	}
+-
++	// params from RunJobFlowInput - cc
++	if v, ok := d.GetOk("additional_info"); ok {
++		params.AdditionalInfo = aws.String(v.(string))
++	}
++	if v, ok := d.GetOk("steps"); ok {
++		steps_ := v.(*schema.Set).List()
++		params.Steps = expandSteps(steps_)
++	}
++	if v, ok := d.GetOk("scale_down_behavior"); ok {
++		params.ScaleDownBehavior = aws.String(v.(string))
++	}
+ 	if v, ok := d.GetOk("log_uri"); ok {
+ 		params.LogUri = aws.String(v.(string))
+ 	}
+@@ -372,6 +444,7 @@ func resourceAwsEMRClusterRead(d *schema.ResourceData, meta interface{}) error {
+ 	d.Set("service_role", cluster.ServiceRole)
+ 	d.Set("security_configuration", cluster.SecurityConfiguration)
+ 	d.Set("autoscaling_role", cluster.AutoScalingRole)
++	d.Set("scale_down_behaviour"), cluster.ScaleDownBehavior)
+ 	d.Set("release_label", cluster.ReleaseLabel)
+ 	d.Set("log_uri", cluster.LogUri)
+ 	d.Set("master_public_dns", cluster.MasterPublicDnsName)
+@@ -470,7 +543,66 @@ func resourceAwsEMRClusterUpdate(d *schema.ResourceData, meta interface{}) error
+ 			return errModify
+ 		}
+ 	}
++// cancel steps if change
++    var emrStepsNotFound = errors.New("No matching Steps.....xxxx")
++	if d.HasChange("steps") {
++		d.SetPartial("steps")
++		groups, err := fetchAllSteps(meta, d.Id())
++		if steps != nil {
++			switch err {
++				case emrStepsNotFound:
++					log.Printf("[DEBUG] EMR Steps (%s) not found, removing", d.Id())
++					d.SetId("")
++					return nil
++				default:
++					return err
++		    }
++			_, errModify := conn.CancelSteps(&emr.CancelStepsInput{
++			ClusterId: aws.String(d.Id()),
++			StepIds: []*string{aws.String(d.Get("visible_to_all_users")),
++		})
++			
++		}
++		
++		
++
++		params := &emr.ModifyInstanceGroupsInput{
++			InstanceGroups: []*emr.InstanceGroupModifyConfig{
++				{
++					InstanceGroupId: coreGroup.Id,
++					InstanceCount:   aws.Int64(int64(coreInstanceCount) - 1),
++				},
++			},
++		}
++		_, errModify := conn.ModifyInstanceGroups(params)
++		if errModify != nil {
++			log.Printf("[ERROR] %s", errModify)
++			return errModify
++		}
++
++		log.Printf("[DEBUG] Modify EMR Cluster done...")
++
++		log.Println("[INFO] Waiting for EMR Cluster to be available")
++
++		stateConf := &resource.StateChangeConf{
++			Pending:    []string{"STARTING", "BOOTSTRAPPING"},
++			Target:     []string{"WAITING", "RUNNING"},
++			Refresh:    resourceAwsEMRClusterStateRefreshFunc(d, meta),
++			Timeout:    40 * time.Minute,
++			MinTimeout: 10 * time.Second,
++			Delay:      5 * time.Second,
++		}
++
++		_, err = stateConf.WaitForState()
++		if err != nil {
++			return fmt.Errorf("[WARN] Error waiting for EMR Cluster state to be \"WAITING\" or \"RUNNING\" after modification: %s", err)
++		}
++		
++	}
++
++// need to re-add steps
+ 
++	
+ 	if d.HasChange("termination_protection") {
+ 		d.SetPartial("termination_protection")
+ 		_, errModify := conn.SetTerminationProtection(&emr.SetTerminationProtectionInput{
+@@ -727,7 +859,92 @@ func setTagsEMR(conn *emr.EMR, d *schema.ResourceData) error {
+ 
+ 	return nil
+ }
++func fetchAllSteps(meta interface{}, clusterId string) ([]*emr.step, error) {
++	conn := meta.(*AWSClient).emrconn
++	req := &emr.ListStepsInput{
++		ClusterId: aws.String(clusterId),
++		StepStates: []string{"WAITING", "RUNNING"},
++	}
++
++	var steps []*emr.step
++	marker := aws.String("intitial")
++	for marker != nil {
++		log.Printf("[DEBUG] EMR Cluster Instance Marker: %s", *marker)
++		respGrps, errGrps := conn.ListInstanceGroups(req)
++		if errGrps != nil {
++			return nil, fmt.Errorf("[ERR] Error reading EMR cluster (%s): %s", clusterId, errGrps)
++		}
++		if respGrps == nil {
++			return nil, fmt.Errorf("[ERR] Error reading EMR Instance Group for cluster (%s)", clusterId)
++		}
++
++		if respGrps.InstanceGroups != nil {
++			for _, g := range respGrps.InstanceGroups {
++				groups = append(groups, g)
++			}
++		} else {
++			log.Printf("[DEBUG] EMR Instance Group list was empty")
++		}
++		marker = respGrps.Marker
++	}
++
++	if len(groups) == 0 {
++		return nil, fmt.Errorf("[WARN] No instance groups found for EMR Cluster (%s)", clusterId)
++	}
++
++	return groups, nil
++}
++
++func findsteps(steps []*emr.InstanceGroup, typ string) *emr.InstanceGroup {
++	for _, step := range steps {
++		if step.InstanceGroupType != nil {
++			if *grp.InstanceGroupType == typ {
++				return grp
++			}
++		}
++	}
++	return nil
++}
++func expandKeyValueList(m map[string]interface{}) []*emr.KeyValue {
++	var result []*emr.KeyValue
++	for k, v := range m {
++		result = append(result, &emr.KeyValue{
++			Key:   aws.String(k),
++			Value: aws.String(v.(string)),
++		})
++	}
++	return result
++}
++
++func expandSteps(steps_ []interface{}) []*emr.StepConfig {
++	stepsOut := []*emr.StepConfig{}
++
++	for _, raw := range steps_ {
++		stepAttributes := raw.(map[string]interface{})
++		stepName := stepAttributes["name"].(string)
++		stepArgs := stepAttributes["args"].([]interface{})
++		stepActionOnFailure := stepAttributes["action_on_failure"].(string)
++		stepJar := stepAttributes["jar"].(string)
++		stepClass := stepAttributes["class"].(string)
++		stepProperties := stepAttributes["properties"].(map[string]interface{})
++
++		steps := &emr.StepConfig{
++			Name:            aws.String(stepName),
++			ActionOnFailure: aws.String(stepActionOnFailure),
++			HadoopJarStep: &emr.HadoopJarStepConfig{
++				Jar:        aws.String(stepJar),
++				Args:       expandStringList(stepArgs),
++				MainClass:  aws.String(stepClass),
++				Properties: expandKeyValueList(stepProperties),
++			},
++		}
++
++		stepsOut = append(stepsOut, steps)
++	}
++	return stepsOut
++}
+ 
++//============================
+ func expandBootstrapActions(bootstrapActions []interface{}) []*emr.BootstrapActionConfig {
+ 	actionsOut := []*emr.BootstrapActionConfig{}
+ 
+

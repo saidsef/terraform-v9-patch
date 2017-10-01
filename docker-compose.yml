@@ -1,0 +1,7 @@
+version: '3'
+services:
+  me:
+    build: .
+    image: me
+    volumes:
+     - ../terraform:/opt/gopath/src/github.com/hashicorp/terraform
